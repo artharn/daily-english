@@ -240,6 +240,27 @@
   .audio-btn.teal:hover{background:var(--green); color:#0e0e1a;}
   .audio-btn:disabled{opacity:0.5; cursor:not-allowed;}
   .audio-note{font-size:11px; color:var(--ink-dim);}
+  .now-playing{
+    display:none;
+    align-items:center;
+    gap:7px;
+    font-size:12px;
+    font-weight:600;
+    color:var(--blue);
+    background:rgba(79,179,255,0.1);
+    border:1px solid rgba(79,179,255,0.3);
+    padding:7px 12px;
+    border-radius:9px;
+    margin:0 0 12px;
+  }
+  .now-playing::before{
+    content:"";
+    width:7px; height:7px;
+    border-radius:50%;
+    background:var(--blue);
+    animation:pulse 1s infinite;
+    flex-shrink:0;
+  }
 
   .paper{
     background:var(--card-raised);
@@ -657,6 +678,47 @@ function isValidUnit(u){
     && Array.isArray(u.speaking) && u.speaking.length >= 2;
 }
 
+/* ---------- story API (100 fixed stories, no repeat until all 100 shown) ---------- */
+const STORY_API_BASE = 'https://private-13f363-dailyenglish.apiary-mock.com';
+const STORY_API_COUNT = 100;
+
+async function getUsedStoryIds(){
+  try{
+    const result = await window.storage.get('usedStoryIds', false);
+    if(result && result.value){
+      const arr = JSON.parse(result.value);
+      if(Array.isArray(arr)) return arr;
+    }
+  }catch(e){ /* no saved value yet, or storage unavailable */ }
+  return [];
+}
+
+async function saveUsedStoryIds(ids){
+  try{ await window.storage.set('usedStoryIds', JSON.stringify(ids), false); }catch(e){ /* ignore */ }
+}
+
+async function fetchStoryFromAPI(){
+  let usedIds = await getUsedStoryIds();
+  let available = [];
+  for(let i = 1; i <= STORY_API_COUNT; i++){
+    if(!usedIds.includes(i)) available.push(i);
+  }
+  if(available.length === 0){
+    // every story has been shown at least once — clear the tracker and start a fresh random cycle
+    usedIds = [];
+    available = Array.from({length: STORY_API_COUNT}, (_, i) => i + 1);
+  }
+  const id = pick(available);
+  const res = await fetch(`${STORY_API_BASE}/story${id}`);
+  if(!res.ok) throw new Error('API request failed: ' + res.status);
+  const data = await res.json();
+  const story = Array.isArray(data) ? data[0] : data;
+  if(!isValidUnit(story)) throw new Error('malformed story from API');
+  usedIds.push(id);
+  await saveUsedStoryIds(usedIds);
+  return story;
+}
+
 async function generateStoryViaAI(attempt){
   attempt = attempt || 1;
   const avoidTopics = recentTopics.slice(-6).join(', ') || 'none yet';
@@ -722,34 +784,102 @@ function nextFallbackUnit(){
   return fallbackQueue.pop();
 }
 
-function stopAudio(){ if('speechSynthesis' in window){ window.speechSynthesis.cancel(); } }
+let currentStoryUtterance = null;
+let cachedVoices = [];
 
-function playAudio(rate){
+function loadVoices(){
+  if(!('speechSynthesis' in window)) return;
+  cachedVoices = window.speechSynthesis.getVoices();
+  if(cachedVoices.length === 0){
+    window.speechSynthesis.onvoiceschanged = () => { cachedVoices = window.speechSynthesis.getVoices(); };
+  }
+}
+loadVoices();
+
+function pickEnglishVoice(){
+  if(!('speechSynthesis' in window)) return null;
+  if(cachedVoices.length === 0) cachedVoices = window.speechSynthesis.getVoices();
+  return cachedVoices.find(v => v.lang && v.lang.toLowerCase().startsWith('en')) || cachedVoices[0] || null;
+}
+
+function setNowPlaying(text){
+  const el = document.getElementById('nowPlaying');
+  if(!el) return;
+  if(text){ el.textContent = text; el.style.display = 'flex'; }
+  else{ el.style.display = 'none'; }
+}
+
+function updatePlayPauseUI(playing, mode){
+  const pauseBtn = document.getElementById('pauseBtn');
+  const stopBtn = document.getElementById('stopStoryBtn');
+  if(pauseBtn){ pauseBtn.textContent = '❚❚ Pause'; pauseBtn.disabled = !playing; }
+  if(stopBtn){ stopBtn.disabled = !playing; }
+  if(playing) setNowPlaying(`▶ Playing now — ${mode} speed`);
+  else setNowPlaying(null);
+}
+
+function stopAudio(){
+  if('speechSynthesis' in window){ window.speechSynthesis.cancel(); }
+  updatePlayPauseUI(false);
+}
+
+function playAudio(rate, mode){
   if(!('speechSynthesis' in window)){
     alert("This browser doesn't support text-to-speech. Try Chrome or Edge, or read the passage aloud yourself for the shadowing step.");
     return;
   }
-  stopAudio();
-  const u = new SpeechSynthesisUtterance(currentUnit.passage);
-  u.rate = rate; u.lang = 'en-US';
-  window.speechSynthesis.speak(u);
+  window.speechSynthesis.cancel();
+  setNowPlaying(`Loading ${mode} speed…`);
+  // Chrome silently drops rate changes if speak() fires in the same tick as cancel() — small delay fixes it
+  setTimeout(() => {
+    const u = new SpeechSynthesisUtterance(currentUnit.passage);
+    u.rate = rate;
+    u.lang = 'en-US';
+    const voice = pickEnglishVoice();
+    if(voice) u.voice = voice;
+    u.onstart = () => updatePlayPauseUI(true, mode);
+    u.onend = () => updatePlayPauseUI(false, mode);
+    u.onerror = () => updatePlayPauseUI(false, mode);
+    currentStoryUtterance = u;
+    window.speechSynthesis.speak(u);
+  }, 120);
+}
+
+function togglePauseStory(){
+  if(!('speechSynthesis' in window)) return;
+  if(window.speechSynthesis.speaking && !window.speechSynthesis.paused){
+    window.speechSynthesis.pause();
+    document.getElementById('pauseBtn').textContent = '▶ Continue';
+    const el = document.getElementById('nowPlaying');
+    if(el) el.textContent = el.textContent.replace('▶ Playing now', '⏸ Paused');
+  } else if(window.speechSynthesis.paused){
+    window.speechSynthesis.resume();
+    document.getElementById('pauseBtn').textContent = '❚❚ Pause';
+    const el = document.getElementById('nowPlaying');
+    if(el) el.textContent = el.textContent.replace('⏸ Paused', '▶ Playing now');
+  }
 }
 
 /* ---------- vocab listening challenge ---------- */
-let lastVocabWord = null;
+let vocabQueue = [];
+function nextVocabWord(){
+  if(!currentUnit) return null;
+  if(vocabQueue.length === 0){
+    vocabQueue = shuffle(currentUnit.vocab);
+  }
+  return vocabQueue.pop();
+}
 function playRandomVocabWord(){
   if(!currentUnit) return;
-  let choices = currentUnit.vocab.filter(v => v[0] !== lastVocabWord);
-  if(choices.length === 0) choices = currentUnit.vocab;
-  currentVocabPick = pick(choices);
-  lastVocabWord = currentVocabPick[0];
+  currentVocabPick = nextVocabWord();
   document.getElementById('vocabWordDisplay').textContent = '? ? ? ? ?';
   document.getElementById('vocabMeaningDisplay').textContent = '';
   if(!('speechSynthesis' in window)){
     alert("This browser doesn't support text-to-speech.");
     return;
   }
-  stopAudio();
+  window.speechSynthesis.cancel();
+  updatePlayPauseUI(false);
   const u = new SpeechSynthesisUtterance(currentVocabPick[0]);
   u.lang = 'en-US'; u.rate = 0.85;
   window.speechSynthesis.speak(u);
@@ -904,10 +1034,12 @@ function buildListening(freqVal){
   <div class="channel listening">
     <div class="ch-head"><div class="ch-name">Listening</div><div class="ch-time">60 min</div></div>
     <div class="audio-row">
-      <button class="audio-btn" onclick="playAudio(0.85)">▶ Play story (slow)</button>
-      <button class="audio-btn" onclick="playAudio(1)">▶ Play story (normal)</button>
-      <button class="audio-btn stop" onclick="stopAudio()">■ Stop</button>
+      <button class="audio-btn" onclick="playAudio(0.6,'slow')">▶ Play story (slow)</button>
+      <button class="audio-btn" onclick="playAudio(1.1,'normal')">▶ Play story (normal)</button>
+      <button class="audio-btn stop" id="pauseBtn" onclick="togglePauseStory()" disabled>❚❚ Pause</button>
+      <button class="audio-btn stop" id="stopStoryBtn" onclick="stopAudio()" disabled>■ Stop</button>
     </div>
+    <div class="now-playing" id="nowPlaying" style="display:none;"></div>
     <div class="audio-note">Audio reads today's story aloud. No text — just listen.</div>
     <ul class="ch-steps">
       <li><b>Warm-up</b> 10 min — read only the title. Guess what the story might be about, out loud.</li>
@@ -1001,25 +1133,32 @@ async function generateSession(){
   stopAudio();
   if(isRecording) stopRecording();
   finalTranscript = '';
+  vocabQueue = [];
 
   document.getElementById('tuneBtn').disabled = true;
   document.getElementById('rerollBtn').disabled = true;
-  document.getElementById('hint').textContent = "Tuning in… writing today's story now.";
+  document.getElementById('hint').textContent = "Tuning in… fetching today's story.";
 
+  let sourceTag = '';
   try{
-    currentUnit = await generateStoryViaAI();
-    usingAI = true;
-  }catch(e){
-    // offline or API hiccup — fall back to the built-in story bank, cycling through all of them before any repeat
-    currentUnit = nextFallbackUnit();
-    usingAI = false;
+    currentUnit = await fetchStoryFromAPI();
+    sourceTag = '';
+  }catch(apiErr){
+    try{
+      currentUnit = await generateStoryViaAI();
+      sourceTag = ' · AI-written';
+    }catch(aiErr){
+      // API and AI both unavailable — fall back to the built-in story bank, cycling through all of them before any repeat
+      currentUnit = nextFallbackUnit();
+      sourceTag = ' · offline set';
+    }
   }
   recentTopics.push(currentUnit.topic);
   recentTitles.push(currentUnit.title);
 
   const fL = randFreq(), fR = randFreq(), fS = randFreq();
 
-  document.getElementById('storyTopic').textContent = currentUnit.topic + (usingAI ? '' : ' · offline set');
+  document.getElementById('storyTopic').textContent = currentUnit.topic + sourceTag;
   document.getElementById('storyTitle').textContent = "\u201C" + currentUnit.title + "\u201D";
   document.getElementById('storyMeta').classList.add('show');
 
@@ -1031,9 +1170,9 @@ async function generateSession(){
   document.getElementById('channels').innerHTML = html;
   document.getElementById('channels').classList.add('show');
   document.getElementById('footerRow').style.display = 'flex';
-  document.getElementById('hint').textContent = usingAI
-    ? "On air — freshly written for you. Same story runs through all three channels."
-    : "On air — couldn't reach the AI writer, so this one's from the offline story set.";
+  document.getElementById('hint').textContent = sourceTag
+    ? "On air — same story runs through all three channels."
+    : "On air — fresh from today's story set. Same story runs through all three channels.";
 
   document.getElementById('tuneBtn').disabled = false;
   document.getElementById('rerollBtn').disabled = false;

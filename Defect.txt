@@ -1,0 +1,4 @@
+- play story slow and normal mode is same speed not different.
+- when i stop i cant continue -> expect is pause and continue is better.
+- Vocab ear-training should random by not same until random as 0 will resume new ramdom.
+- 
