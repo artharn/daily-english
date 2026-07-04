@@ -764,7 +764,6 @@ Respond with ONLY valid JSON, no markdown fences, no commentary, in exactly this
 function pick(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
 function randFreq(){ return (Math.floor(Math.random()*(1079-881+1))+881)/10; }
 
-let fallbackQueue = [];
 function shuffle(arr){
   const a = arr.slice();
   for(let i = a.length - 1; i > 0; i--){
@@ -773,15 +772,34 @@ function shuffle(arr){
   }
   return a;
 }
-function nextFallbackUnit(){
-  if(fallbackQueue.length === 0){
-    fallbackQueue = shuffle(units);
-    // avoid immediately repeating the story we just showed, if possible
-    if(currentUnit && fallbackQueue[0] && fallbackQueue[0].title === currentUnit.title && fallbackQueue.length > 1){
-      [fallbackQueue[0], fallbackQueue[1]] = [fallbackQueue[1], fallbackQueue[0]];
+
+async function getUsedFallbackTitles(){
+  try{
+    const result = await window.storage.get('usedFallbackTitles', false);
+    if(result && result.value){
+      const arr = JSON.parse(result.value);
+      if(Array.isArray(arr)) return arr;
     }
+  }catch(e){ /* no saved value yet, or storage unavailable */ }
+  return [];
+}
+
+async function saveUsedFallbackTitles(titles){
+  try{ await window.storage.set('usedFallbackTitles', JSON.stringify(titles), false); }catch(e){ /* ignore */ }
+}
+
+async function nextFallbackUnit(){
+  let usedTitles = await getUsedFallbackTitles();
+  let available = units.filter(u => !usedTitles.includes(u.title));
+  if(available.length === 0){
+    // every offline story has been shown at least once — clear the tracker and start fresh
+    usedTitles = [];
+    available = units.slice();
   }
-  return fallbackQueue.pop();
+  const chosen = pick(available);
+  usedTitles.push(chosen.title);
+  await saveUsedFallbackTitles(usedTitles);
+  return chosen;
 }
 
 let currentStoryUtterance = null;
@@ -896,35 +914,52 @@ function setReadingLoading(loading){
   btn.disabled = loading;
   btn.textContent = loading ? 'Reviewing…' : 'Check my understanding';
 }
+
+function buildReadingPrompt(answers){
+  return `You are a warm, encouraging English teacher for a Thai intermediate learner. They just read this short story:
+
+Title: ${currentUnit.title}
+${currentUnit.passage}
+
+Comprehension questions and their answers:
+1. ${currentUnit.comprehension[0]}
+Answer: ${answers[0] || '(left blank)'}
+2. ${currentUnit.comprehension[1]}
+Answer: ${answers[1] || '(left blank)'}
+3. ${currentUnit.comprehension[2]}
+Answer: ${answers[2] || '(left blank)'}
+
+Please respond in Thai (ภาษาไทย) with this structure:
+1. ตรวจคำตอบ (Validation) — สำหรับแต่ละคำตอบ บอกว่าตอบถูกต้องตรงตามเนื้อเรื่องหรือไม่ ถ้าไม่ถูกต้อง ให้แก้ไขให้อย่างสุภาพ
+2. คำแนะนำ (Suggestion) — ชี้จุดที่ควรแก้ไขด้านไวยากรณ์หรือการเลือกใช้คำในคำตอบ 1-2 จุด (ถ้ามี) โดยยกประโยคภาษาอังกฤษที่เขาเขียนมาอ้างอิง แล้วอธิบายเป็นภาษาไทย
+3. ข้อเสนอแนะ (Feedback) — ให้คำแนะนำเฉพาะเจาะจงหนึ่งข้อว่าควรโฟกัสอะไรเพื่ออ่านจับใจความให้ครบถ้วนมากขึ้นในครั้งต่อไป
+
+กฎสำคัญ:
+- ข้อความอธิบายทั่วไปให้เป็นภาษาไทย
+- คำตอบเดิมของผู้เรียน และประโยคภาษาอังกฤษที่แก้ไขให้ถูกต้องแล้ว ต้องคงเป็นภาษาอังกฤษในเครื่องหมายคำพูดเสมอ ห้ามแปลเป็นภาษาไทย เช่น เขียนว่า "he go to school" ควรแก้เป็น "he goes to school"
+- เมื่อจะอ้างอิงข้อเท็จจริงจากเนื้อเรื่อง (เช่น คำตอบที่ถูกต้องของคำถาม) ห้ามสรุปหรือแปลเป็นภาษาไทยตรงๆ ให้ยกประโยคหรือวลีจากเนื้อเรื่องต้นฉบับเป็นภาษาอังกฤษก่อนในเครื่องหมายคำพูด แล้วตามด้วยคำแปลภาษาไทยในวงเล็บทันที เช่น: "Maria wanted to go to Edinburgh, but she boarded the train to Glasgow by mistake" (มาเรียต้องการไปเมืองเอดินบะระ แต่ขึ้นรถไฟไปเมืองกลาสโกว์ผิดขบวน)
+
+เขียนด้วยน้ำเสียงอบอุ่น ให้กำลังใจ ความยาวรวมไม่เกิน 200 คำ เป็นข้อความธรรมดา ไม่ใช้ markdown หรือเครื่องหมายดอกจัน`;
+}
+
+function openInClaude(promptText){
+  const url = 'https://claude.ai/new?q=' + encodeURIComponent(promptText);
+  window.open(url, '_blank');
+}
+
 async function checkReading(){
   const a = [0,1,2].map(i => document.getElementById('ans'+i).value.trim());
   if(!a[0] && !a[1] && !a[2]){
     alert('Write at least one answer first.');
     return;
   }
-  setReadingLoading(true);
+  const prompt = buildReadingPrompt(a);
+  openInClaude(prompt);
+
   const box = document.getElementById('readingReviewBox');
   const textEl = document.getElementById('readingReviewText');
   box.style.display = 'block';
-  textEl.textContent = '…';
-  try{
-    const prompt = `You are a warm, encouraging English teacher for an intermediate learner. They just read this short story:\n\nTitle: ${currentUnit.title}\n${currentUnit.passage}\n\nComprehension questions and their answers:\n1. ${currentUnit.comprehension[0]}\nAnswer: ${a[0] || '(left blank)'}\n2. ${currentUnit.comprehension[1]}\nAnswer: ${a[1] || '(left blank)'}\n3. ${currentUnit.comprehension[2]}\nAnswer: ${a[2] || '(left blank)'}\n\nRespond with: (1) for each answer, one short line saying if it shows correct understanding, with a gentle correction if not, (2) one or two grammar or word-choice fixes if you see any, (3) one specific recommendation for what to focus on to read more completely next time. Keep the whole reply under 150 words, plain text, no markdown headers or asterisks, warm tone.`;
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 1000,
-        messages: [{ role: "user", content: prompt }]
-      })
-    });
-    const data = await res.json();
-    const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
-    textEl.textContent = text || "No feedback came back — try again in a moment.";
-  }catch(e){
-    textEl.textContent = "Couldn't reach the review service. Check your connection and try again.";
-  }
-  setReadingLoading(false);
+  textEl.textContent = "Opened a new tab in Claude.ai with your story, questions, and answers already filled in — just hit send there to get your feedback.";
 }
 
 /* ---------- speaking: record + review ---------- */
@@ -935,8 +970,12 @@ function updateRecordUI(){
 }
 
 function startRecording(){
-  finalTranscript = document.getElementById('speakingTranscript').value ? document.getElementById('speakingTranscript').value + ' ' : '';
+  document.getElementById('speakingTranscript').value = '';
+  finalTranscript = '';
   audioChunks = [];
+  const playback = document.getElementById('speakingPlayback');
+  if(playback){ playback.style.display = 'none'; playback.src = ''; }
+  document.getElementById('transcriptNote').textContent = 'Speak your retelling and answers to the prompts below. Your words appear as text as you talk (Chrome/Edge). No mic access? Just type instead.';
 
   if(navigator.mediaDevices && navigator.mediaDevices.getUserMedia){
     navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
@@ -990,37 +1029,40 @@ function stopRecording(){
   updateRecordUI();
 }
 
-function setSpeakingLoading(loading){
-  const btn = document.getElementById('reviewSpeakingBtn');
-  btn.disabled = loading;
-  btn.textContent = loading ? 'Reviewing…' : 'Send for AI review';
+function buildSpeakingPrompt(transcript){
+  return `You are a warm, encouraging English speaking coach for a Thai intermediate learner. Today's story was "${currentUnit.title}": ${currentUnit.passage}
+
+Speaking prompts they responded to:
+${currentUnit.speaking.map((q,i) => (i+1)+'. '+q).join('\n')}
+
+Target vocabulary for today: ${currentUnit.vocab.map(v => v[0]).join(', ')}
+
+Here is a transcript of what the learner said out loud:
+"${transcript}"
+
+Please respond in Thai (ภาษาไทย) with this structure:
+1. ตรวจคำพูด (Validation) — บอกว่าคำตอบที่พูดครอบคลุมและตรงกับโจทย์หรือไม่ และใช้คำศัพท์เป้าหมายของวันนี้หรือเปล่า
+2. คำแนะนำ (Suggestion) — แก้ไขจุดที่ผิดไวยากรณ์หรือการเลือกใช้คำ 2-3 จุด โดยยกประโยคภาษาอังกฤษที่เขาพูดมาอ้างอิงตรงๆ แล้วอธิบายวิธีแก้เป็นภาษาไทย
+3. ข้อเสนอแนะ (Feedback) — ให้เคล็ดลับหนึ่งข้อเพื่อพูดให้ลื่นไหลและเป็นธรรมชาติมากขึ้นในครั้งต่อไป พร้อมประโยคให้กำลังใจปิดท้าย
+
+กฎสำคัญ:
+- ข้อความอธิบายทั่วไปให้เป็นภาษาไทย
+- สิ่งที่ผู้เรียนพูดจริง และประโยคภาษาอังกฤษที่แก้ไขให้ถูกต้องแล้ว ต้องคงเป็นภาษาอังกฤษในเครื่องหมายคำพูดเสมอ ห้ามแปลเป็นภาษาไทย เช่น เขียนว่า "he go to school" ควรแก้เป็น "he goes to school"
+- เมื่อจะอ้างอิงข้อเท็จจริงจากเนื้อเรื่อง ห้ามสรุปหรือแปลเป็นภาษาไทยตรงๆ ให้ยกประโยคหรือวลีจากเนื้อเรื่องต้นฉบับเป็นภาษาอังกฤษก่อนในเครื่องหมายคำพูด แล้วตามด้วยคำแปลภาษาไทยในวงเล็บทันที เช่น: "Maria wanted to go to Edinburgh, but she boarded the train to Glasgow by mistake" (มาเรียต้องการไปเมืองเอดินบะระ แต่ขึ้นรถไฟไปเมืองกลาสโกว์ผิดขบวน)
+
+เขียนด้วยน้ำเสียงอบอุ่น ให้กำลังใจ ความยาวรวมไม่เกิน 220 คำ เป็นข้อความธรรมดา ไม่ใช้ markdown หรือเครื่องหมายดอกจัน`;
 }
+
 async function reviewSpeaking(){
   const transcript = document.getElementById('speakingTranscript').value.trim();
   if(!transcript){ alert('Record or type what you said first.'); return; }
-  setSpeakingLoading(true);
+  const prompt = buildSpeakingPrompt(transcript);
+  openInClaude(prompt);
+
   const box = document.getElementById('speakingReviewBox');
   const textEl = document.getElementById('speakingReviewText');
   box.style.display = 'block';
-  textEl.textContent = '…';
-  try{
-    const prompt = `You are a warm, encouraging English speaking coach for an intermediate learner. Today's story was "${currentUnit.title}": ${currentUnit.passage}\n\nSpeaking prompts they responded to:\n${currentUnit.speaking.map((q,i) => (i+1)+'. '+q).join('\n')}\n\nTarget vocabulary for today: ${currentUnit.vocab.map(v => v[0]).join(', ')}\n\nHere is a transcript of what the learner said out loud:\n"${transcript}"\n\nGive feedback: (1) 2-3 specific grammar or word-choice corrections, quoting their exact phrase and the fix, (2) note if they used any of today's target vocabulary, (3) one tip to sound more fluent or natural next time, (4) end with one encouraging sentence. Keep it under 180 words, plain text, no markdown headers or asterisks.`;
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 1000,
-        messages: [{ role: "user", content: prompt }]
-      })
-    });
-    const data = await res.json();
-    const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
-    textEl.textContent = text || "No feedback came back — try again in a moment.";
-  }catch(e){
-    textEl.textContent = "Couldn't reach the review service. Check your connection and try again.";
-  }
-  setSpeakingLoading(false);
+  textEl.textContent = "Opened a new tab in Claude.ai with your story, prompts, and transcript already filled in — just hit send there to get your feedback.";
 }
 
 /* ---------- channel builders ---------- */
