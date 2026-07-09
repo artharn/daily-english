@@ -266,7 +266,6 @@ const App = (function(){
   const SEED_WORDS = ["umbrella","train station","borrowed book","broken clock","spare key","street market","voicemail","new neighbor","missed bus","old photograph","recipe card","garden gate","office plant","lost glove","night shift","corner cafe","paper map","spare change","quiet library","first snow"];
 
   function pick(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
-  function randFreq(){ return (Math.floor(Math.random()*(1079-881+1))+881)/10; }
 
   function shuffle(arr){
     const a = arr.slice();
@@ -658,9 +657,7 @@ const App = (function(){
   function vocabChips(vocab){ return vocab.map(([w,m]) => `<div class="vocab-chip md-body-small"><b>${w}</b> — ${m}</div>`).join(''); }
   function qList(items){ return `<ul class="q-list md-body-medium">${items.map(q=>`<li>${q}</li>`).join('')}</ul>`; }
 
-  function buildListening(freqVal){
-    document.getElementById('freq-l').textContent = freqVal.toFixed(1);
-    document.getElementById('freq-l').classList.remove('off');
+  function buildListening(){
     return `
     <div class="channel listening">
       <div class="ch-head"><div class="ch-name md-title-medium">Listening</div><div class="ch-time md-label-small">60 min</div></div>
@@ -691,9 +688,7 @@ const App = (function(){
     </div>`;
   }
 
-  function buildReading(freqVal, unit){
-    document.getElementById('freq-r').textContent = freqVal.toFixed(1);
-    document.getElementById('freq-r').classList.remove('off');
+  function buildReading(unit){
     const answerBlocks = unit.comprehension.map((q,i) => `
       <div class="answer-block">
         <div class="q-text md-body-medium">${i+1}. ${q}</div>
@@ -726,9 +721,7 @@ const App = (function(){
     </div>`;
   }
 
-  function buildSpeaking(freqVal, unit){
-    document.getElementById('freq-s').textContent = freqVal.toFixed(1);
-    document.getElementById('freq-s').classList.remove('off');
+  function buildSpeaking(unit){
     return `
     <div class="channel speaking">
       <div class="ch-head"><div class="ch-name md-title-medium">Speaking</div><div class="ch-time md-label-small">60 min</div></div>
@@ -787,16 +780,15 @@ const App = (function(){
     state.recentTopics.push(state.currentUnit.topic);
     state.recentTitles.push(state.currentUnit.title);
 
-    const fL = randFreq(), fR = randFreq(), fS = randFreq();
 
     document.getElementById('storyTopic').textContent = state.currentUnit.topic + sourceTag;
     document.getElementById('storyTitle').textContent = "\u201C" + state.currentUnit.title + "\u201D";
     document.getElementById('storyMeta').classList.add('show');
 
     let html = "";
-    html += buildListening(fL);
-    html += buildReading(fR, state.currentUnit);
-    html += buildSpeaking(fS, state.currentUnit);
+    html += buildListening();
+    html += buildReading(state.currentUnit);
+    html += buildSpeaking(state.currentUnit);
 
     document.getElementById('channels').innerHTML = html;
     document.getElementById('channels').classList.add('show');

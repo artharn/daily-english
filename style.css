@@ -183,7 +183,7 @@
   .dial{
     background:var(--md-primary-container);
     border-radius:var(--shape-lg);
-    padding:12px 8px;
+    padding:24px 16px;
     text-align:center;
   }
   .dial:nth-child(2){background:var(--md-success-container);}
