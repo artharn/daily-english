@@ -11,28 +11,28 @@ A single-page English practice tool: one short story, three 60-minute channels �
 | **Question Challenge** | Comprehension questions that reinforce and deepen your understanding of the story. |
 | **AI-Powered Feedback** | After answering the questions, your responses are reviewed by Claude, which provides corrections and personalized suggestions. |
 
-# 📚 Daily English — Learning Roadmap
+## 📚 Daily English — Learning Roadmap
 
-## Week 1: Foundation
+### Week 1: Foundation
 - [ ] Complete 1 full 3-hour session (get familiar with all 5 features)
 - [ ] Log all 5 vocab words per story (notebook/spreadsheet)
 - [ ] Try Vocab Challenge *before* reading — guess by ear first
 - **Target:** 5–7 stories · ~30 vocab words
 
-## Week 2–3: Building
+### Week 2–3: Building
 - [ ] Listen at **normal speed only** first — slow speed is backup, not default
 - [ ] Use AI Feedback every session, not occasionally
 - [ ] Answer comprehension questions in full, detailed sentences
 - [ ] Reuse 2–3 old vocab words daily before starting new story
 - **Target:** +15 stories · consistent AI review · fewer repeat grammar mistakes
 
-## Week 4: Consolidation
+### Week 4: Consolidation
 - [ ] Retell the story out loud from memory *before* opening Reading card
 - [ ] Track recurring grammar corrections across sessions (spot patterns)
 - [ ] Revisit a Week 1 story — should feel noticeably easier
 - **Target:** ~30 stories total · 150+ vocab words touched
 
-## Month 2+: Second Pass
+### Month 2+: Second Pass
 - [ ] Once most of the ~100 stories are seen, start a second round
 - [ ] Push for faster answers, longer retells, fuller speaking
 - **Rule of thumb:** a story isn't "done" until you've used its vocab in your own sentence out loud
