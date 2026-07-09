@@ -1,0 +1,844 @@
+/* ================================================================
+   Daily English — app script
+   ----------------------------------------------------------------
+   Structure (top to bottom):
+     CONFIG            constants: API endpoints, storage keys, speech rates
+     STATE             single source of truth for mutable app state
+     DATA              offline fallback stories (25 stories, used when
+                        the API and AI generation are both unavailable)
+     UTILS             small pure helper functions (pick, shuffle, etc.)
+     STORY SOURCES     three ways a story can be obtained, tried in order:
+                          1. fetchStoryFromAPI()      — mock REST API
+                          2. generateStoryViaAI()     — Claude API
+                          3. nextFallbackUnit()       — offline data above
+     SPEECH SYNTHESIS  Listening tab: play / pause / resume / stop
+     VOCAB TRAINER     Listening tab: "hear a random word" game
+     AI REVIEW PROMPTS builds the prompts sent to Claude for feedback
+     READING CHECK     Reading tab: "Check my understanding" flow
+     SPEAKING FLOW     Speaking tab: record, transcribe, review
+     UI RENDERING      builds the HTML for each of the 3 channel cards
+     SESSION LIFECYCLE generateSession() — ties everything together
+     PUBLIC API        functions exposed to the page's inline onclick
+                        handlers and to the Ready/Retune buttons
+   ================================================================ */
+
+const App = (function(){
+  'use strict';
+
+  /* ============================== CONFIG ============================== */
+  const CONFIG = {
+    STORY_API_BASE: 'https://private-13f363-dailyenglish.apiary-mock.com',
+    STORY_API_COUNT: 100,
+    CLAUDE_MODEL: 'claude-sonnet-4-6',
+    STORAGE_KEYS: {
+      usedApiIds: 'usedStoryIds',           // tracks which of the 100 API stories this browser has seen
+      usedFallbackTitles: 'usedFallbackTitles' // same idea, for the 25 offline stories
+    },
+    SPEECH_RATE: { slow: 0.6, normal: 1.1, vocabWord: 0.85 },
+    SPEECH_START_DELAY_MS: 120, // Chrome silently drops rate changes if speak() fires in the same tick as cancel()
+    RECENT_HISTORY_SIZE: { topics: 6, titles: 8 } // how many past stories to tell the AI to avoid repeating
+  };
+
+  /* ============================== STATE ================================ */
+  /** Single mutable state object — avoids scattered top-level `let` globals. */
+  const state = {
+    currentUnit: null,          // the story currently on screen: {topic, title, passage, vocab, comprehension, speaking}
+    currentVocabPick: null,     // the vocab word currently loaded in the ear-training box
+    currentStoryUtterance: null,// the active SpeechSynthesisUtterance for the story audio
+    mediaRecorder: null,        // active MediaRecorder instance while recording speech
+    audioChunks: [],            // recorded audio blob chunks, collected during a recording session
+    recognition: null,          // active SpeechRecognition instance (live transcription)
+    isRecording: false,
+    finalTranscript: '',        // accumulated final (non-interim) transcript text
+    recentTopics: [],           // last few story topics shown, to avoid the AI repeating itself
+    recentTitles: [],           // last few exact story titles shown
+    vocabQueue: [],             // shuffled queue of this story's 5 vocab words (ear-training, no repeats)
+    cachedVoices: []            // cached list of available speechSynthesis voices
+  };
+
+  /* ============================== DATA ================================= */
+  /** 25 offline stories used only if both the API and the AI generator fail. */
+  const OFFLINE_STORIES = [
+  {
+    topic:"Travel",
+    title:"The Backpack That Almost Stayed Home",
+    passage:"Mara had planned this trip for almost a year. She saved money every month, read blogs about the itinerary, and made a checklist longer than her arm. On the morning of her flight, she was so nervous that she left her backpack by the door and walked out without it. She didn't notice until she was already in the taxi, halfway to the airport. Her hands started shaking. She called her roommate, who was still asleep, and begged her to bring the bag to the airport as fast as possible. For thirty minutes, Mara paced near the check-in counter, watching the clock and imagining her trip disappearing. Finally, her roommate arrived, out of breath, holding the backpack over her head like a trophy. Mara laughed so hard she almost cried. Looking back, she says the panic taught her something: pack the night before, not the morning of. Now, before every trip, she double-checks her bags twice, once the night before, and once again right before she leaves the house.",
+    vocab:[["itinerary","a planned route or schedule for a trip"],["pace","to walk back and forth nervously"],["trophy","a prize you win or hold up proudly"],["double-check","to check something again to be sure"],["panic","sudden, strong fear"]],
+    comprehension:["What did Mara forget, and when did she realize it?","Who helped her, and how did that person react when they arrived?","What habit did Mara change after this experience?"],
+    speaking:["Retell Mara's story in your own words, out loud, in under 2 minutes.","Have you ever almost missed something because you forgot an item? Tell the story.","What's one thing you always double-check before you leave home?"]
+  },
+  {
+    topic:"Food",
+    title:"Grandma's Secret Ingredient",
+    passage:"Every Sunday, Daniel's grandmother made the same soup, and every Sunday, someone asked for the recipe. She always smiled and said, it's just vegetables and patience. For years, nobody believed her, the soup tasted too rich to be that simple. One day, Daniel decided to watch her cook from start to finish, without asking any questions. She chopped onions slowly, let them turn golden instead of rushing them, and added a spoonful of something dark from a small jar with no label. When he asked what it was, she just winked. It turned out to be a spoonful of soy sauce, mixed with a little roasted garlic she prepared the night before. The secret wasn't a rare spice, it was time. She never rushed a single step. Daniel tried to copy the recipe at home, but his soup never tasted quite the same. Maybe, he thought, the real secret ingredient really was patience, and maybe a little bit of grandmother's magic too.",
+    vocab:[["patience","the ability to wait calmly"],["rich","having a strong, deep flavor"],["chop","to cut into small pieces"],["rushing","doing something too quickly, without care"],["spice","a strong-flavored ingredient used in cooking"]],
+    comprehension:["Why did people not believe grandma's answer about the recipe?","What did Daniel discover when he finally watched her cook?","What does Daniel think the 'real' secret ingredient is?"],
+    speaking:["Retell the story of grandma's soup in your own words.","Describe a dish that reminds you of your family.","Do you agree that patience can be a 'secret ingredient' in cooking? Why or why not?"]
+  },
+  {
+    topic:"Technology",
+    title:"The Phone That Knew Too Much",
+    passage:"Leo used to think his phone was just a tool. Then one day, he mentioned to a friend, out loud, no typing, that he wanted new running shoes. The next morning, his social media was full of running shoe ads. He told himself it was a coincidence. But it kept happening: he'd think about a trip to Japan, and suddenly every app was showing him flights to Tokyo. Curious and a little uncomfortable, Leo started researching how this actually works. He learned that apps don't usually record everything you say, but they collect small clues, your searches, your location, even how long you look at certain photos, and use that to guess what you might want next. It wasn't magic, just very smart pattern matching. Still, Leo decided to turn off some permissions on his phone. He didn't fully trust the coincidence explanation. Now, when an ad appears that feels too accurate, he just closes the app and shrugs, half amused, half suspicious.",
+    vocab:[["coincidence","when two things happen together by chance"],["permission","the right to access or use something"],["pattern-matching","finding repeated clues to make a guess"],["curious","wanting to know or learn something"],["suspicious","feeling that something is not quite right"]],
+    comprehension:["What made Leo start to suspect his phone was listening to him?","What did he learn about how apps actually predict what you want?","What did he do after learning this?"],
+    speaking:["Retell Leo's story in your own words.","Has an ad ever felt 'too accurate' to you? What happened?","Do you think apps should be allowed to collect this kind of information? Why or why not?"]
+  },
+  {
+    topic:"Health",
+    title:"The Ten-Minute Rule",
+    passage:"Amir hated exercise. Every time he tried to start a routine, he'd quit within a week, telling himself he simply wasn't the type of person who enjoyed it. A friend suggested something strange: commit to only ten minutes. Not an hour, not even thirty minutes, just ten. If after ten minutes he wanted to stop, he could. Amir agreed, mostly because it sounded too easy to fail. The first day, he walked for ten minutes and felt fine, so he kept walking for twenty more. The second day, the same thing happened. By the second week, he wasn't forcing himself to start anymore, he was actually looking forward to it. The trick, his friend explained, wasn't really about exercise at all. It was about removing the mental wall that made starting feel so hard. Once Amir was already moving, continuing felt natural. Months later, he still uses the ten-minute rule, not just for exercise, but for anything he's been avoiding, from cleaning his apartment to answering emails.",
+    vocab:[["routine","a fixed, regular set of actions"],["commit","to promise to do something"],["mental wall","the fear or resistance that blocks you from starting"],["natural","normal, not forced"],["avoid","to stay away from doing something"]],
+    comprehension:["Why did Amir keep quitting exercise before trying the ten-minute rule?","What usually happened after he started the ten minutes?","How does he use the 'ten-minute rule' now, months later?"],
+    speaking:["Retell Amir's story in your own words.","Is there a 'mental wall' you have around starting something? Describe it.","Would the ten-minute rule work for you? Why or why not?"]
+  },
+  {
+    topic:"Environment",
+    title:"The Street That Grew a Forest",
+    passage:"When Priya moved into her new apartment, the street outside was grey and treeless, just concrete, parked cars, and heat. She planted one small tree in a pot outside her door, mostly to make her own entrance feel less bare. A neighbor asked where she got it and planted one too. Within a year, five more trees appeared along the same street, each one planted by a different resident who simply liked what they saw growing next door. Nobody organized it. No city program paid for it. It just spread, one small decision copying another. By the third summer, the street had actual shade for the first time anyone could remember, and people started sitting outside in the evenings instead of hiding indoors from the heat. Priya says she never meant to start anything, she just wanted one tree. But she likes to think that good ideas, like trees, don't need permission to spread. They just need one person willing to go first.",
+    vocab:[["concrete","a hard grey building material used for streets"],["resident","a person who lives in a place"],["spread","to grow and reach more people or places"],["shade","a shadowed, cooler area away from direct sun"],["permission","official or formal approval"]],
+    comprehension:["Why did Priya plant the first tree?","How did more trees end up appearing on the street?","What does Priya believe about good ideas at the end of the story?"],
+    speaking:["Retell the story of the street and the trees.","Describe a small change you've seen spread in your neighborhood or community.","Do you agree that 'good ideas don't need permission to spread'? Why?"]
+  },
+  {
+    topic:"Movies",
+    title:"The Film Nobody Wanted to Make",
+    passage:"When the director first pitched her film, every studio said no. The story was too quiet, they said, no big battles, no famous actors, just two strangers talking on a train for two hours. She kept the script in a drawer for six years, taking it out occasionally to rewrite a scene, before a small studio finally agreed to fund it, with almost no budget. The film was shot in eleven days, mostly on a real train, with a crew of twelve people. When it was finally released, critics called it one of the most honest films of the year. Audiences didn't come for explosions, they came because the conversation between the two strangers felt more real than most big-budget dialogue they'd heard in years. The director still keeps the original rejection letters in a folder, not out of bitterness, she says, but as a reminder that nobody wants it yet is different from nobody will ever want it.",
+    vocab:[["pitch","to propose an idea to someone who might fund it"],["budget","the amount of money available for a project"],["crew","the team of people who make a film"],["critic","someone whose job is to review films, books, or art"],["rejection","the act of being told no or turned away"]],
+    comprehension:["Why did studios initially reject the film?","How was the film eventually made?","Why does the director keep the rejection letters?"],
+    speaking:["Retell the story of the director and her film.","Have you ever kept trying at something despite early rejection? Tell the story.","Do you agree 'nobody wants it yet' is different from 'nobody will ever want it'? Why?"]
+  },
+  {
+    topic:"Work",
+    title:"The Meeting That Never Happened",
+    passage:"Every Monday, Sofia's team had a one-hour meeting that, by her count, could have been a two-line email. People rarely disagreed, decisions were rarely made, and half the room checked their phones under the table. One Monday, she asked her manager if they could try something different: cancel the meeting for a month and replace it with a short written update instead. Her manager was skeptical but agreed to test it. In week one, people wrote lazy, one-line updates. By week three, something shifted, because there was no meeting to hide in, people had to actually think about what they'd done and what mattered. Written updates got longer, clearer, and more useful. When the month ended, the team voted almost unanimously to keep the new system. The meeting wasn't completely gone, they kept a short quarterly check-in, but the weekly ritual that had eaten up so many hours simply disappeared, and nobody seemed to miss it.",
+    vocab:[["skeptical","doubting that something will work"],["unanimously","with everyone agreeing"],["ritual","a fixed activity repeated regularly"],["disagree","to have a different opinion"],["update","a short report on progress"]],
+    comprehension:["What was wrong with the original Monday meeting?","What did Sofia propose instead of the meeting?","What changed in how people wrote their updates over time?"],
+    speaking:["Retell the story of Sofia's meeting experiment.","Do you think meetings at your work or school are usually useful? Why or why not?","If you could cancel one regular meeting or class in your life, which would it be, and why?"]
+  },
+  {
+    topic:"Family",
+    title:"The Letter in the Box",
+    passage:"After his father passed away, Tomás was cleaning out the garage when he found an old shoebox taped shut, with his name written on the lid in his father's handwriting. Inside was a single letter, dated almost twenty years earlier, written the year Tomás was born. His father wrote about how nervous he was to be a parent, how little sleep he was getting, and how he hoped, more than anything, that his son would grow up kind. There was no big secret, no hidden fortune, just one ordinary man's honest thoughts, sealed away for two decades. Tomás sat on the garage floor and read it three times. He said later that he'd spent years wondering what kind of person his father really was underneath the quiet, serious man he remembered. The letter didn't answer every question, but it answered the one that mattered most: his father had loved him, nervously and completely, from the very beginning.",
+    vocab:[["taped shut","closed and sealed with tape"],["fortune","a large amount of money"],["sealed","closed completely so nothing can get in or out"],["ordinary","normal, not special or unusual"],["nervously","in a way that shows worry or fear"]],
+    comprehension:["What did Tomás find in the garage, and who wrote it?","What did the letter talk about?","What question did the letter answer for Tomás?"],
+    speaking:["Retell the story of Tomás and the letter.","If you wrote a letter to a future family member, what would you want them to know?","Do you keep any letters, photos, or objects that hold a family memory? Describe one."]
+  },
+  {
+    topic:"Money",
+    title:"The Jar with Three Labels",
+    passage:"When Wei was eleven, her mother gave her three glass jars labeled Spend, Save, and Share, and told her that every bit of money she earned, from birthday gifts to selling old toys, had to be divided between them. At first, Wei resented it, she wanted to spend everything on comic books immediately. But over the years, watching the Save jar slowly fill up taught her something her mother never explicitly said out loud: money isn't just something you have, it's something you decide about, again and again, in small amounts. By eighteen, Wei had saved enough from years of small deposits to buy her first laptop without asking her parents for help. She still uses a version of the three-jar system today, just digital now, separate accounts instead of glass jars. She says the amounts changed completely over the years, but the habit of dividing, deciding, and not spending everything at once never did.",
+    vocab:[["label","a word or name attached to something"],["resent","to feel angry about something that seems unfair"],["deposit","an amount of money added to a savings account"],["habit","something you do regularly, almost automatically"],["divide","to split into separate parts"]],
+    comprehension:["What were the three jars for, and how old was Wei when she got them?","How did Wei feel about the system at first, and how did that change?","What does Wei still do today, even though she's an adult?"],
+    speaking:["Retell the story of Wei and the three jars.","Did anyone teach you about money when you were young? What did they teach you?","Do you think a system like this would work for you? Why or why not?"]
+  },
+  {
+    topic:"Sports",
+    title:"The Runner Who Finished Last",
+    passage:"In her first marathon, Keiko finished dead last, nearly two hours behind the winner. She crossed the finish line long after the crowd had gone home and the volunteers had started packing up the tables. Only a few people were left to see her finish, and one of them, a stranger holding a folding chair, stopped and clapped for a full minute. Keiko cried, not from disappointment, but from something closer to relief. She had trained for eight months after a difficult year, and finishing, regardless of the time on the clock, meant she had done something she once thought impossible for her. She posted her finish-line photo online later that night, expecting silence. Instead, dozens of people messaged her, several admitting they'd never finished anything they'd started that year. Keiko says she no longer measures the race by the time on the clock. She measures it by the fact that, on a hard day eight months earlier, she decided to start anyway.",
+    vocab:[["marathon","a long-distance race of about 42 kilometers"],["volunteer","a person who helps without being paid"],["disappointment","the feeling of sadness when something doesn't go as hoped"],["relief","a feeling of comfort after stress or worry ends"],["measure","to judge the size or value of something"]],
+    comprehension:["How did Keiko do in her marathon compared to the other runners?","Why did she cry at the finish line?","How does she 'measure' the race now, according to the story?"],
+    speaking:["Retell Keiko's story in your own words.","Have you ever felt proud of finishing something, even if you weren't 'the best' at it? Tell the story.","Do you agree that finishing something hard matters more than winning? Why or why not?"]
+  },
+  {
+    topic:"School",
+    title:"The Wrong Backpack",
+    passage:"Tom was in a hurry on his first day at a new school. He grabbed a backpack from the hallway and ran outside. On the bus, he opened it to check his books, but the bag was full of someone else's things: a red notebook, two pencils, and a small toy car. Tom felt his face turn red. He didn't know what to do. At school, he asked his teacher for help. She smiled and said this happens every year. She checked the name inside the bag and found a boy named Sam in another class. Tom walked to Sam's classroom and gave the bag back. Sam laughed and said his bag looked exactly the same. The two boys swapped bags and started talking. By lunchtime, they were sitting together, and Tom had a new friend on his very first day.",
+    vocab:[["hurry","to move or act quickly"],["swap","to exchange one thing for another"],["classroom","a room where lessons happen"],["exactly","completely correct, precisely"],["laugh","to make sounds that show you find something funny"]],
+    comprehension:["What mistake did Tom make on the bus?","How did Tom find out whose bag it was?","What happened after Tom returned the bag?"],
+    speaking:["Retell the story of Tom and the wrong backpack.","Have you ever taken the wrong thing by mistake? Tell the story.","How do you usually make new friends?"]
+  },
+  {
+    topic:"Weather",
+    title:"The Umbrella He Never Used",
+    passage:"Every morning, Ben checked the weather before leaving home. If it looked cloudy, he carried his umbrella, just in case. His friends laughed at him because it almost never rained. For months, the umbrella stayed closed in his bag, taking up space and getting a little heavy. One Friday, Ben forgot it at home for the first time in a year. That afternoon, the sky turned dark, and rain started falling hard and fast. Ben ran to the bus stop, completely soaked, while everyone around him opened their umbrellas calmly. He stood there, dripping wet, feeling silly. The next Monday, his friends noticed something: Ben was carrying his umbrella again, and this time, nobody laughed. They just smiled and said maybe he was right all along.",
+    vocab:[["cloudy","having a sky covered with clouds"],["just in case","as a precaution, in preparation for something"],["soaked","extremely wet"],["dripping","having liquid falling from something in drops"],["calmly","in a relaxed way, without stress"]],
+    comprehension:["Why did Ben always carry an umbrella?","What happened the day he forgot it?","How did his friends react at the end of the story?"],
+    speaking:["Retell Ben's umbrella story in your own words.","Do you usually check the weather before going out? Why or why not?","Describe a time you got caught in bad weather without the right clothes."]
+  },
+  {
+    topic:"Shopping",
+    title:"Three Trips for One Item",
+    passage:"Lucia only needed one thing: a birthday candle for her sister's cake. She walked to the corner shop, but they were out of candles. She tried a second shop, and they only had colors she didn't like. By the third shop, tired and a little annoyed, she finally found a simple white candle for less than a dollar. She had spent almost an hour walking around town for one small item. When she got home, her sister laughed and said she already had candles in the kitchen drawer the whole time. Lucia sat down, exhausted, and started laughing too. She said next time, she would check at home first before going anywhere at all.",
+    vocab:[["item","a single thing, especially one on a list"],["annoyed","feeling slightly angry"],["exhausted","extremely tired"],["drawer","a sliding box built into furniture for storing things"],["check","to look at something to make sure it is correct"]],
+    comprehension:["What was Lucia trying to buy?","How many shops did she visit, and why?","What did she discover when she got home?"],
+    speaking:["Retell Lucia's shopping story in your own words.","Have you ever spent a long time looking for something small? Tell the story.","What's one thing you always check before going shopping?"]
+  },
+  {
+    topic:"Neighbors",
+    title:"The Loud Wall",
+    passage:"When Sana moved into her apartment, she noticed the wall next to her bedroom was very thin. Every night, she could hear her neighbor's television, sometimes until midnight. For weeks, she stayed quiet, not wanting to seem rude. Finally, tired and unable to sleep, she knocked gently on her neighbor's door. An older man opened it, looking surprised. Sana explained the problem politely, and he apologized right away, saying he didn't know the walls were that thin. He turned down the volume and even offered her tea. After that night, they became friendly, often saying hello in the hallway. Sana realized that one small, polite conversation had solved a problem she had quietly suffered with for weeks.",
+    vocab:[["thin","not thick; easy to see or hear through"],["rude","not polite"],["knock","to hit a door lightly to get attention"],["apologize","to say sorry"],["volume","how loud a sound is"]],
+    comprehension:["What problem did Sana have with her apartment?","What did she finally do about it?","How did the situation change afterward?"],
+    speaking:["Retell Sana's story about her noisy neighbor.","Have you ever had a problem with a neighbor? What happened?","Why do you think Sana waited so long to say something?"]
+  },
+  {
+    topic:"Pets",
+    title:"The Cat Who Chose Him",
+    passage:"Marco never planned to get a cat. One rainy evening, a small grey cat followed him home from the market and sat outside his door, meowing softly. He tried to shoo it away gently, but it didn't leave. The next morning, it was still there, waiting patiently in the same spot. Marco finally opened the door, and the cat walked in like it already lived there. He put up signs around the neighborhood asking if anyone had lost a cat, but nobody answered. Weeks passed, and the cat, now named Grey, slept on his bed every night and greeted him at the door every evening. Marco often tells people he didn't choose his cat. His cat chose him.",
+    vocab:[["follow","to move behind someone as they walk"],["meow","the sound a cat makes"],["patiently","in a calm way, without complaining while waiting"],["greet","to say hello to someone"],["gently","in a soft, careful way"]],
+    comprehension:["How did Marco first meet the cat?","What did he do to try to find the cat's owner?","What is Marco's cat's life like now?"],
+    speaking:["Retell the story of Marco and his cat.","Do you have a pet, or would you like one? Describe it, or describe your dream pet.","Have you ever found or adopted an animal? Tell the story."]
+  },
+  {
+    topic:"Music",
+    title:"Learning the Wrong Song",
+    passage:"For his cousin's wedding, Ravi practiced a guitar song for three whole months. He learned every note perfectly and felt ready. On the day of the wedding, he stood up in front of everyone, took a breath, and began to play, confident and calm. Halfway through, he noticed his cousin looking confused. It turned out Ravi had learned the wrong version of the song, an older cover, not the one his cousin actually wanted. Everyone laughed kindly, including the bride and groom, and Ravi finished the song anyway, a little embarrassed but smiling. Later, his cousin told him it didn't matter at all. What mattered was that Ravi had spent three months learning something just for them.",
+    vocab:[["practice","to repeat an activity to improve at it"],["confident","sure of yourself, not nervous"],["version","one particular form of something that exists in different forms"],["embarrassed","feeling shy or ashamed in front of others"],["matter","to be important"]],
+    comprehension:["How long did Ravi practice, and what happened at the wedding?","Why was there confusion during the song?","What did his cousin say afterward?"],
+    speaking:["Retell Ravi's story about the wedding song.","Have you ever prepared for something and it didn't go as planned? Tell the story.","Do you play an instrument, or is there one you'd like to learn?"]
+  },
+  {
+    topic:"Time",
+    title:"The Watch That Ran Fast",
+    passage:"For years, Elena's grandfather wore an old watch that ran five minutes fast. Everyone in the family knew about it and simply subtracted five minutes whenever he mentioned the time. One day, his watch stopped completely, and he bought a brand new one that told the exact, correct time. Strangely, he started arriving late to everything, something that had never happened before. It took the family a while to understand why: for decades, he had unconsciously relied on those extra five minutes to feel on schedule. Once they disappeared, his whole sense of timing shifted. Eventually, he set his new watch five minutes fast, on purpose this time, and went right back to always being early.",
+    vocab:[["subtract","to take away a number from another"],["unconsciously","without realizing or noticing"],["rely on","to depend on something or someone"],["on schedule","happening at the planned time"],["on purpose","done deliberately, not by accident"]],
+    comprehension:["Why didn't the family mind that the watch ran fast?","What happened after he got a new, accurate watch?","What did he finally do to fix the problem?"],
+    speaking:["Retell the story of the grandfather's watch.","Are you usually early, late, or on time? Why do you think that is?","Do you have any small habits or tricks that help you manage time?"]
+  },
+  {
+    topic:"Friendship",
+    title:"The Empty Chair",
+    passage:"Every week for two years, Noah and his friend Ivy met at the same coffee shop table for two. When Ivy moved to another city for work, Noah kept going to the same shop out of habit, sitting alone at the same table. At first, it felt strange and a little sad, staring at the empty chair across from him. But slowly, he started noticing other regulars: a man who read the newspaper, a woman who always brought a small dog. One day, the newspaper man asked if he could sit down, since his usual table was taken. Noah said yes. They talked for an hour. It wasn't the same as sitting with Ivy, but Noah realized that the table itself had never been the important part.",
+    vocab:[["habit","something you do regularly, almost without thinking"],["strange","unusual or unfamiliar"],["regular","a person who visits a place often"],["realize","to become fully aware of something"],["important","having great value or meaning"]],
+    comprehension:["What did Noah and Ivy do every week?","What changed after Ivy moved away?","What did Noah realize by the end of the story?"],
+    speaking:["Retell the story of Noah and the empty chair.","Do you have a regular place you go to meet a friend? Describe it.","Has a close friend ever moved away? How did you stay in touch, or did you?"]
+  },
+  {
+    topic:"Home",
+    title:"Painting the Wrong Room",
+    passage:"While their parents were away for the weekend, two brothers decided to surprise them by painting the living room a fresh blue color. They worked hard all Saturday, moving furniture and carefully covering the floor. By evening, the room looked completely different, and they felt proud of their work. When their parents came home, their mother stood in the doorway, silent for a moment. It turned out she had actually planned to paint the guest bedroom, not the living room, and had already bought different paint for it weeks earlier. She laughed instead of getting angry, saying the living room did need a new color anyway. The brothers helped paint the guest room the following weekend, using the correct color this time.",
+    vocab:[["surprise","to make someone feel unexpected pleasure or shock"],["furniture","large movable objects like tables and chairs"],["proud","feeling pleased about an achievement"],["silent","completely quiet"],["correct","right, without mistakes"]],
+    comprehension:["What did the two brothers do while their parents were away?","What mistake had they made?","How did their mother react?"],
+    speaking:["Retell the story of the brothers painting the room.","Have you ever tried to surprise someone and it didn't go as planned? Tell the story.","If you could repaint one room in your home, which one, and what color?"]
+  },
+  {
+    topic:"Seasons",
+    title:"Waiting for Snow",
+    passage:"Every winter, Yuki waited for the first snow of the year, checking outside her window each morning before school. Some years, snow came in early November; other years, she waited until January, checking the sky every single day. Her classmates thought it was strange that she cared so much about something she couldn't control. One December morning, she woke up before her alarm, sensing something different in the air. She opened the curtains and saw the whole street covered in white for the first time that year. She stood at the window for several minutes, just watching, before waking her little brother to show him. Some traditions, she later said, don't need a reason. They just need to be repeated, year after year.",
+    vocab:[["alarm","a device or sound that wakes you up"],["sense","to feel something without clear proof"],["curtain","cloth hung to cover a window"],["cover","to put something over another thing"],["tradition","a custom repeated over time, often yearly"]],
+    comprehension:["What did Yuki do every winter?","What happened on the December morning described in the story?","What does Yuki think about traditions at the end?"],
+    speaking:["Retell Yuki's story about waiting for snow.","Do you have a small yearly tradition of your own? Describe it.","What's your favorite season, and why?"]
+  },
+  {
+    topic:"Transportation",
+    title:"The Long Way Home",
+    passage:"David took the same bus route to work every day for five years, always getting off at the same stop. One evening, road construction blocked his usual street, and the bus driver announced a different route home. David didn't recognize any of the streets outside his window. Instead of feeling annoyed, he found himself curious, watching new shops and parks pass by that he never knew existed, just a few streets from his own house. He got off one stop early, on purpose, and walked the rest of the way home slowly, past a small bakery he decided to visit the next morning. The detour that night added twenty extra minutes to his trip, but David said it was the first time in years his commute had felt interesting.",
+    vocab:[["route","the road or way taken to get somewhere"],["construction","the building or repairing of roads or buildings"],["announce","to tell people about something officially"],["curious","wanting to know or learn something"],["detour","a longer, different way to a place"]],
+    comprehension:["What usually happened on David's daily bus ride?","Why did the route change one evening?","How did David feel about the unfamiliar streets, and what did he do?"],
+    speaking:["Retell David's story about the different bus route.","Do you have a daily commute or routine trip? Describe it.","Has an unexpected change of plans ever led to something good for you? Tell the story."]
+  },
+  {
+    topic:"Celebrations",
+    title:"The Cake That Wasn't Ready",
+    passage:"Aiko had ordered a birthday cake for her father weeks in advance, choosing his favorite flavor, chocolate with orange. On the morning of the party, she went to pick it up, only to learn the bakery had lost her order completely. With just four hours before guests arrived, she panicked, then decided to bake one herself, something she had never done before. Her kitchen turned into a mess of flour and broken eggshells, but slowly, a slightly uneven, slightly burnt cake came together. When she presented it that evening, she admitted honestly what had happened. Her father looked at the crooked cake, then at her tired, flour-covered face, and said it was the best birthday cake he'd ever had, mistakes and all.",
+    vocab:[["in advance","ahead of time, before something happens"],["flavor","the taste of food"],["panic","to feel sudden strong fear or worry"],["uneven","not smooth or equal"],["admit","to say something is true, even if difficult"]],
+    comprehension:["What went wrong with Aiko's plan for her father's birthday?","What did she decide to do instead?","How did her father respond to the cake?"],
+    speaking:["Retell Aiko's story about the birthday cake.","Have you ever had to solve a problem at the last minute? Tell the story.","Describe a celebration or birthday you remember well."]
+  },
+  {
+    topic:"Hobbies",
+    title:"Page Two Hundred",
+    passage:"For years, Farid told people he loved reading, but he rarely finished a book, always stopping somewhere around page fifty, distracted by something else. His sister challenged him to finish just one book completely, any book, by the end of the year. He chose a long novel he had started three times already and forced himself to keep going, even through the slow chapters in the middle. Around page two hundred, something changed: the story picked up, and he found himself reading late into the night instead of falling asleep. He finished the book two weeks before the deadline, closing it with a strange, satisfied feeling he hadn't expected. He immediately picked up a second book, this time without being challenged by anyone at all.",
+    vocab:[["distracted","unable to focus because of something else"],["challenge","to invite someone to try something difficult"],["novel","a long fictional book"],["chapter","one section of a book"],["satisfied","pleased because something was achieved"]],
+    comprehension:["What was Farid's habit with books before his sister's challenge?","What happened around page two hundred of the novel?","What did Farid do right after finishing the book?"],
+    speaking:["Retell Farid's story about finishing the book.","Do you have a hobby you often start but don't finish? Describe it.","What's a book, show, or project that surprised you once you got further into it?"]
+  },
+  {
+    topic:"Restaurant",
+    title:"The Wrong Order, the Right Meal",
+    passage:"Tariq went to a small restaurant and tried to order his usual dish, but he mispronounced the name slightly, and the waiter brought something completely different: a spicy noodle soup he had never tried before. Tariq almost sent it back, but the smell was too good to resist, so he decided to try a bite first. It turned out to be one of the best meals he'd had in months, full of flavors he couldn't quite name. He asked the waiter what the dish was called and wrote it down carefully in his phone this time. From then on, he ordered it on purpose, every single visit, and often told the story of the mistake that led him to his new favorite meal.",
+    vocab:[["mispronounce","to say a word incorrectly"],["resist","to stop yourself from doing something tempting"],["flavor","a distinct taste"],["on purpose","done deliberately, not by accident"],["favorite","liked more than all others"]],
+    comprehension:["Why did Tariq receive the wrong dish?","What did he decide to do instead of sending it back?","What did he do differently on future visits?"],
+    speaking:["Retell Tariq's story about the restaurant mistake.","Has a mistake ever led you to discover something you now love? Tell the story.","What's your favorite dish, and how did you first try it?"]
+  },
+  {
+    topic:"Weekend",
+    title:"Doing Absolutely Nothing",
+    passage:"After a stressful month at work, Hana decided her weekend plan would be to have no plan at all. No errands, no phone calls, no schedule. She woke up Saturday without an alarm, made coffee slowly, and sat by the window for almost an hour, just watching people walk by outside. At first, the silence felt uncomfortable, like she was forgetting something important. By the afternoon, though, she felt calmer than she had in weeks, reading half a magazine and taking a long, unplanned nap. Her friends later asked what she did all weekend, expecting a story or an adventure. Hana simply said, nothing, and smiled, meaning it as the highest compliment she could give a weekend.",
+    vocab:[["stressful","causing worry or pressure"],["errand","a short trip to do a specific task"],["silence","complete quiet"],["uncomfortable","not relaxed or at ease"],["compliment","a remark expressing praise"]],
+    comprehension:["What was Hana's plan for the weekend?","How did she feel at the beginning of the day compared to the afternoon?","What did Hana mean when she said 'nothing' at the end?"],
+    speaking:["Retell Hana's story about her do-nothing weekend.","What does a perfect, relaxing weekend look like for you?","Do you find it easy or hard to do 'nothing'? Why?"]
+  }
+  ];
+
+
+    /* ============================== UTILS ================================ */
+  const SEED_WORDS = ["umbrella","train station","borrowed book","broken clock","spare key","street market","voicemail","new neighbor","missed bus","old photograph","recipe card","garden gate","office plant","lost glove","night shift","corner cafe","paper map","spare change","quiet library","first snow"];
+
+  function pick(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
+  function randFreq(){ return (Math.floor(Math.random()*(1079-881+1))+881)/10; }
+
+  function shuffle(arr){
+    const a = arr.slice();
+    for(let i = a.length - 1; i > 0; i--){
+      const j = Math.floor(Math.random() * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  }
+
+  function isValidStoryUnit(unit){
+    return unit && typeof unit.topic === 'string' && typeof unit.title === 'string' && typeof unit.passage === 'string'
+      && Array.isArray(unit.vocab) && unit.vocab.length >= 4
+      && unit.vocab.every(v => Array.isArray(v) && v.length === 2)
+      && Array.isArray(unit.comprehension) && unit.comprehension.length >= 2
+      && Array.isArray(unit.speaking) && unit.speaking.length >= 2;
+  }
+
+  /* ---------- story API (100 fixed stories, no repeat until all 100 shown) ---------- */
+  async function getUsedStoryIds(){
+    try{
+      const result = await window.storage.get(CONFIG.STORAGE_KEYS.usedApiIds, false);
+      if(result && result.value){
+        const arr = JSON.parse(result.value);
+        if(Array.isArray(arr)) return arr;
+      }
+    }catch(e){ /* no saved value yet, or storage unavailable */ }
+    return [];
+  }
+
+  async function saveUsedStoryIds(ids){
+    try{ await window.storage.set(CONFIG.STORAGE_KEYS.usedApiIds, JSON.stringify(ids), false); }catch(e){ /* ignore */ }
+  }
+
+  async function fetchStoryFromAPI(){
+    let usedIds = await getUsedStoryIds();
+    let available = [];
+    for(let i = 1; i <= CONFIG.STORY_API_COUNT; i++){
+      if(!usedIds.includes(i)) available.push(i);
+    }
+    if(available.length === 0){
+      // every story has been shown at least once — clear the tracker and start a fresh random cycle
+      usedIds = [];
+      available = Array.from({length: CONFIG.STORY_API_COUNT}, (_, i) => i + 1);
+    }
+    const id = pick(available);
+    const res = await fetch(`${CONFIG.STORY_API_BASE}/story${id}`);
+    if(!res.ok) throw new Error('API request failed: ' + res.status);
+    const data = await res.json();
+    const story = Array.isArray(data) ? data[0] : data;
+    if(!isValidStoryUnit(story)) throw new Error('malformed story from API');
+    usedIds.push(id);
+    await saveUsedStoryIds(usedIds);
+    return story;
+  }
+
+  async function generateStoryViaAI(attempt){
+    attempt = attempt || 1;
+    const avoidTopics = state.recentTopics.slice(-CONFIG.RECENT_HISTORY_SIZE.topics).join(', ') || 'none yet';
+    const avoidTitles = state.recentTitles.slice(-CONFIG.RECENT_HISTORY_SIZE.titles).join(' | ') || 'none yet';
+    const seed = pick(SEED_WORDS);
+    const prompt = `Write one short original English story for an intermediate (B1) English learner, as part of a listening/reading/speaking exercise.
+
+  Requirements:
+  - Pick ONE everyday life topic (e.g. work, family, travel, food, habits, small mistakes, kindness, routines). Avoid these recently used topics: ${avoidTopics}.
+  - Do NOT reuse or lightly rewrite any of these recent titles: ${avoidTitles}.
+  - You may optionally take loose inspiration from this random detail (not required, just a spark): "${seed}".
+  - The story must be 150-200 words, simple B1-level sentences, a clear beginning-middle-end with a small twist or realization.
+  - Choose exactly 5 vocabulary words FROM the story that are useful, mid-frequency English words (roughly Oxford 3000 level), each with a short simple definition.
+  - Write 3 comprehension questions about the story (factual, answerable from the text).
+  - Write 3 speaking prompts: the first must ask the learner to retell the story in their own words; the other two connect the topic to the learner's own life or opinion.
+
+  Respond with ONLY valid JSON, no markdown fences, no commentary, in exactly this shape:
+  {"topic":"...","title":"...","passage":"...","vocab":[["word","meaning"],["word","meaning"],["word","meaning"],["word","meaning"],["word","meaning"]],"comprehension":["...","...","..."],"speaking":["...","...","..."]}`;
+
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        model: CONFIG.CLAUDE_MODEL,
+        max_tokens: 1000,
+        temperature: 1,
+        messages: [{ role: "user", content: prompt }]
+      })
+    });
+    const data = await res.json();
+    const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+    const clean = text.replace(/^```json\s*|^```\s*|```$/g, '').trim();
+    const parsed = JSON.parse(clean);
+    if(!isValidStoryUnit(parsed)) throw new Error('malformed story from AI');
+
+    const isDupe = state.recentTitles.some(t => t.toLowerCase() === parsed.title.toLowerCase());
+    if(isDupe && attempt < 2){
+      return generateStoryViaAI(attempt + 1);
+    }
+    return parsed;
+  }
+
+  async function getUsedFallbackTitles(){
+    try{
+      const result = await window.storage.get(CONFIG.STORAGE_KEYS.usedFallbackTitles, false);
+      if(result && result.value){
+        const arr = JSON.parse(result.value);
+        if(Array.isArray(arr)) return arr;
+      }
+    }catch(e){ /* no saved value yet, or storage unavailable */ }
+    return [];
+  }
+
+  async function saveUsedFallbackTitles(titles){
+    try{ await window.storage.set(CONFIG.STORAGE_KEYS.usedFallbackTitles, JSON.stringify(titles), false); }catch(e){ /* ignore */ }
+  }
+
+  async function nextFallbackUnit(){
+    let usedTitles = await getUsedFallbackTitles();
+    let available = OFFLINE_STORIES.filter(u => !usedTitles.includes(u.title));
+    if(available.length === 0){
+      // every offline story has been shown at least once — clear the tracker and start fresh
+      usedTitles = [];
+      available = OFFLINE_STORIES.slice();
+    }
+    const chosen = pick(available);
+    usedTitles.push(chosen.title);
+    await saveUsedFallbackTitles(usedTitles);
+    return chosen;
+  }
+
+
+  function loadVoices(){
+    if(!('speechSynthesis' in window)) return;
+    state.cachedVoices = window.speechSynthesis.getVoices();
+    if(state.cachedVoices.length === 0){
+      window.speechSynthesis.onvoiceschanged = () => { state.cachedVoices = window.speechSynthesis.getVoices(); };
+    }
+  }
+  loadVoices();
+
+  function pickEnglishVoice(){
+    if(!('speechSynthesis' in window)) return null;
+    if(state.cachedVoices.length === 0) state.cachedVoices = window.speechSynthesis.getVoices();
+    return state.cachedVoices.find(v => v.lang && v.lang.toLowerCase().startsWith('en')) || state.cachedVoices[0] || null;
+  }
+
+  function setNowPlaying(text){
+    const el = document.getElementById('nowPlaying');
+    if(!el) return;
+    if(text){ el.textContent = text; el.style.display = 'flex'; }
+    else{ el.style.display = 'none'; }
+  }
+
+  function updatePlayPauseUI(playing, mode){
+    const pauseBtn = document.getElementById('pauseBtn');
+    const stopBtn = document.getElementById('stopStoryBtn');
+    if(pauseBtn){ pauseBtn.textContent = '❚❚ Pause'; pauseBtn.disabled = !playing; }
+    if(stopBtn){ stopBtn.disabled = !playing; }
+    if(playing) setNowPlaying(`▶ Playing now — ${mode} speed`);
+    else setNowPlaying(null);
+  }
+
+  function stopAudio(){
+    if('speechSynthesis' in window){ window.speechSynthesis.cancel(); }
+    updatePlayPauseUI(false);
+  }
+
+  function playAudio(rate, mode){
+    if(!('speechSynthesis' in window)){
+      alert("This browser doesn't support text-to-speech. Try Chrome or Edge, or read the passage aloud yourself for the shadowing step.");
+      return;
+    }
+    window.speechSynthesis.cancel();
+    setNowPlaying(`Loading ${mode} speed…`);
+    // Chrome silently drops rate changes if speak() fires in the same tick as cancel() — small delay fixes it
+    setTimeout(() => {
+      const u = new SpeechSynthesisUtterance(state.currentUnit.passage);
+      u.rate = rate;
+      u.lang = 'en-US';
+      const voice = pickEnglishVoice();
+      if(voice) u.voice = voice;
+      u.onstart = () => updatePlayPauseUI(true, mode);
+      u.onend = () => updatePlayPauseUI(false, mode);
+      u.onerror = () => updatePlayPauseUI(false, mode);
+      state.currentStoryUtterance = u;
+      window.speechSynthesis.speak(u);
+    }, CONFIG.SPEECH_START_DELAY_MS);
+  }
+
+  function togglePauseStory(){
+    if(!('speechSynthesis' in window)) return;
+    if(window.speechSynthesis.speaking && !window.speechSynthesis.paused){
+      window.speechSynthesis.pause();
+      document.getElementById('pauseBtn').textContent = '▶ Continue';
+      const el = document.getElementById('nowPlaying');
+      if(el) el.textContent = el.textContent.replace('▶ Playing now', '⏸ Paused');
+    } else if(window.speechSynthesis.paused){
+      window.speechSynthesis.resume();
+      document.getElementById('pauseBtn').textContent = '❚❚ Pause';
+      const el = document.getElementById('nowPlaying');
+      if(el) el.textContent = el.textContent.replace('⏸ Paused', '▶ Playing now');
+    }
+  }
+
+  /* ---------- vocab listening challenge ---------- */
+  function nextVocabWord(){
+    if(!state.currentUnit) return null;
+    if(state.vocabQueue.length === 0){
+      state.vocabQueue = shuffle(state.currentUnit.vocab);
+    }
+    return state.vocabQueue.pop();
+  }
+  function playRandomVocabWord(){
+    if(!state.currentUnit) return;
+    state.currentVocabPick = nextVocabWord();
+    document.getElementById('vocabWordDisplay').textContent = '? ? ? ? ?';
+    document.getElementById('vocabMeaningDisplay').textContent = '';
+    if(!('speechSynthesis' in window)){
+      alert("This browser doesn't support text-to-speech.");
+      return;
+    }
+    window.speechSynthesis.cancel();
+    updatePlayPauseUI(false);
+    const u = new SpeechSynthesisUtterance(state.currentVocabPick[0]);
+    u.lang = 'en-US'; u.rate = CONFIG.SPEECH_RATE.vocabWord;
+    window.speechSynthesis.speak(u);
+  }
+  function revealVocabWord(){
+    if(!state.currentVocabPick) return;
+    document.getElementById('vocabWordDisplay').textContent = state.currentVocabPick[0];
+    document.getElementById('vocabMeaningDisplay').textContent = state.currentVocabPick[1];
+  }
+
+  /* ---------- reading self-check ---------- */
+  function setReadingLoading(loading){
+    const btn = document.getElementById('checkReadingBtn');
+    btn.disabled = loading;
+    btn.textContent = loading ? 'Reviewing…' : 'Check my understanding';
+  }
+
+  function buildReadingPrompt(answers){
+    return `You are a warm, encouraging English teacher for a Thai intermediate learner. They just read this short story:
+
+  Title: ${state.currentUnit.title}
+  ${state.currentUnit.passage}
+
+  Comprehension questions and their answers:
+  1. ${state.currentUnit.comprehension[0]}
+  Answer: ${answers[0] || '(left blank)'}
+  2. ${state.currentUnit.comprehension[1]}
+  Answer: ${answers[1] || '(left blank)'}
+  3. ${state.currentUnit.comprehension[2]}
+  Answer: ${answers[2] || '(left blank)'}
+
+  Please respond in Thai (ภาษาไทย) with this structure:
+  1. ตรวจคำตอบ (Validation) — สำหรับแต่ละคำตอบ บอกว่าตอบถูกต้องตรงตามเนื้อเรื่องหรือไม่ ถ้าไม่ถูกต้อง ให้แก้ไขให้อย่างสุภาพ
+  2. คำแนะนำ (Suggestion) — ชี้จุดที่ควรแก้ไขด้านไวยากรณ์หรือการเลือกใช้คำในคำตอบ 1-2 จุด (ถ้ามี) โดยยกประโยคภาษาอังกฤษที่เขาเขียนมาอ้างอิง แล้วอธิบายเป็นภาษาไทย
+  3. ข้อเสนอแนะ (Feedback) — ให้คำแนะนำเฉพาะเจาะจงหนึ่งข้อว่าควรโฟกัสอะไรเพื่ออ่านจับใจความให้ครบถ้วนมากขึ้นในครั้งต่อไป
+
+  กฎสำคัญ:
+  - ข้อความอธิบายทั่วไปให้เป็นภาษาไทย
+  - คำตอบเดิมของผู้เรียน และประโยคภาษาอังกฤษที่แก้ไขให้ถูกต้องแล้ว ต้องคงเป็นภาษาอังกฤษในเครื่องหมายคำพูดเสมอ ห้ามแปลเป็นภาษาไทย เช่น เขียนว่า "he go to school" ควรแก้เป็น "he goes to school"
+  - เมื่อจะอ้างอิงข้อเท็จจริงจากเนื้อเรื่อง (เช่น คำตอบที่ถูกต้องของคำถาม) ห้ามสรุปหรือแปลเป็นภาษาไทยตรงๆ ให้ยกประโยคหรือวลีจากเนื้อเรื่องต้นฉบับเป็นภาษาอังกฤษก่อนในเครื่องหมายคำพูด แล้วตามด้วยคำแปลภาษาไทยในวงเล็บทันที เช่น: "Maria wanted to go to Edinburgh, but she boarded the train to Glasgow by mistake" (มาเรียต้องการไปเมืองเอดินบะระ แต่ขึ้นรถไฟไปเมืองกลาสโกว์ผิดขบวน)
+
+  เขียนด้วยน้ำเสียงอบอุ่น ให้กำลังใจ ความยาวรวมไม่เกิน 200 คำ เป็นข้อความธรรมดา ไม่ใช้ markdown หรือเครื่องหมายดอกจัน`;
+  }
+
+  function openInClaude(promptText){
+    const url = 'https://claude.ai/new?q=' + encodeURIComponent(promptText);
+    window.open(url, '_blank');
+  }
+
+  async function checkReading(){
+    const a = [0,1,2].map(i => document.getElementById('ans'+i).value.trim());
+    if(!a[0] && !a[1] && !a[2]){
+      alert('Write at least one answer first.');
+      return;
+    }
+    const prompt = buildReadingPrompt(a);
+    openInClaude(prompt);
+
+    const box = document.getElementById('readingReviewBox');
+    const textEl = document.getElementById('readingReviewText');
+    box.style.display = 'block';
+    textEl.textContent = "Opened a new tab in Claude.ai with your story, questions, and answers already filled in — just hit send there to get your feedback.";
+  }
+
+  /* ---------- speaking: record + review ---------- */
+  function updateRecordUI(){
+    document.getElementById('recordBtn').style.display = state.isRecording ? 'none' : 'inline-flex';
+    document.getElementById('stopRecordBtn').style.display = state.isRecording ? 'inline-flex' : 'none';
+    document.getElementById('recIndicator').style.display = state.isRecording ? 'inline-flex' : 'none';
+  }
+
+  function startRecording(){
+    document.getElementById('speakingTranscript').value = '';
+    state.finalTranscript = '';
+    state.audioChunks = [];
+    const playback = document.getElementById('speakingPlayback');
+    if(playback){ playback.style.display = 'none'; playback.src = ''; }
+    document.getElementById('transcriptNote').textContent = 'Speak your retelling and answers to the prompts below. Your words appear as text as you talk (Chrome/Edge). No mic access? Just type instead.';
+
+    if(navigator.mediaDevices && navigator.mediaDevices.getUserMedia){
+      navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+        state.mediaRecorder = new MediaRecorder(stream);
+        state.mediaRecorder.ondataavailable = e => state.audioChunks.push(e.data);
+        state.mediaRecorder.onstop = () => {
+          const blob = new Blob(state.audioChunks, { type: 'audio/webm' });
+          const url = URL.createObjectURL(blob);
+          const audioEl = document.getElementById('speakingPlayback');
+          audioEl.src = url;
+          audioEl.style.display = 'block';
+          stream.getTracks().forEach(t => t.stop());
+        };
+        state.mediaRecorder.start();
+      }).catch(() => {
+        document.getElementById('transcriptNote').textContent = "Couldn't access the microphone — check browser permissions, or just type what you said below.";
+      });
+    } else {
+      document.getElementById('transcriptNote').textContent = "This browser can't record audio — type what you said below instead.";
+    }
+
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if(SR){
+      state.recognition = new SR();
+      state.recognition.lang = 'en-US';
+      state.recognition.continuous = true;
+      state.recognition.interimResults = true;
+      state.recognition.onresult = (e) => {
+        let interim = '';
+        for(let i = e.resultIndex; i < e.results.length; i++){
+          const t = e.results[i][0].transcript;
+          if(e.results[i].isFinal) state.finalTranscript += t + ' ';
+          else interim += t;
+        }
+        document.getElementById('speakingTranscript').value = (state.finalTranscript + interim).trim();
+      };
+      state.recognition.onerror = () => {};
+      state.recognition.start();
+    } else {
+      document.getElementById('transcriptNote').textContent = "Live transcription isn't supported in this browser — type what you said manually below.";
+    }
+
+    state.isRecording = true;
+    updateRecordUI();
+  }
+
+  function stopRecording(){
+    if(state.mediaRecorder && state.mediaRecorder.state !== 'inactive') state.mediaRecorder.stop();
+    if(state.recognition) { try{ state.recognition.stop(); }catch(e){} }
+    state.isRecording = false;
+    updateRecordUI();
+  }
+
+  function buildSpeakingPrompt(transcript){
+    return `You are a warm, encouraging English speaking coach for a Thai intermediate learner. Today's story was "${state.currentUnit.title}": ${state.currentUnit.passage}
+
+  Speaking prompts they responded to:
+  ${state.currentUnit.speaking.map((q,i) => (i+1)+'. '+q).join('\n')}
+
+  Target vocabulary for today: ${state.currentUnit.vocab.map(v => v[0]).join(', ')}
+
+  Here is a transcript of what the learner said out loud:
+  "${transcript}"
+
+  Please respond in Thai (ภาษาไทย) with this structure:
+  1. ตรวจคำพูด (Validation) — บอกว่าคำตอบที่พูดครอบคลุมและตรงกับโจทย์หรือไม่ และใช้คำศัพท์เป้าหมายของวันนี้หรือเปล่า
+  2. คำแนะนำ (Suggestion) — แก้ไขจุดที่ผิดไวยากรณ์หรือการเลือกใช้คำ 2-3 จุด โดยยกประโยคภาษาอังกฤษที่เขาพูดมาอ้างอิงตรงๆ แล้วอธิบายวิธีแก้เป็นภาษาไทย
+  3. ข้อเสนอแนะ (Feedback) — ให้เคล็ดลับหนึ่งข้อเพื่อพูดให้ลื่นไหลและเป็นธรรมชาติมากขึ้นในครั้งต่อไป พร้อมประโยคให้กำลังใจปิดท้าย
+
+  กฎสำคัญ:
+  - ข้อความอธิบายทั่วไปให้เป็นภาษาไทย
+  - สิ่งที่ผู้เรียนพูดจริง และประโยคภาษาอังกฤษที่แก้ไขให้ถูกต้องแล้ว ต้องคงเป็นภาษาอังกฤษในเครื่องหมายคำพูดเสมอ ห้ามแปลเป็นภาษาไทย เช่น เขียนว่า "he go to school" ควรแก้เป็น "he goes to school"
+  - เมื่อจะอ้างอิงข้อเท็จจริงจากเนื้อเรื่อง ห้ามสรุปหรือแปลเป็นภาษาไทยตรงๆ ให้ยกประโยคหรือวลีจากเนื้อเรื่องต้นฉบับเป็นภาษาอังกฤษก่อนในเครื่องหมายคำพูด แล้วตามด้วยคำแปลภาษาไทยในวงเล็บทันที เช่น: "Maria wanted to go to Edinburgh, but she boarded the train to Glasgow by mistake" (มาเรียต้องการไปเมืองเอดินบะระ แต่ขึ้นรถไฟไปเมืองกลาสโกว์ผิดขบวน)
+
+  เขียนด้วยน้ำเสียงอบอุ่น ให้กำลังใจ ความยาวรวมไม่เกิน 220 คำ เป็นข้อความธรรมดา ไม่ใช้ markdown หรือเครื่องหมายดอกจัน`;
+  }
+
+  async function reviewSpeaking(){
+    const transcript = document.getElementById('speakingTranscript').value.trim();
+    if(!transcript){ alert('Record or type what you said first.'); return; }
+    const prompt = buildSpeakingPrompt(transcript);
+    openInClaude(prompt);
+
+    const box = document.getElementById('speakingReviewBox');
+    const textEl = document.getElementById('speakingReviewText');
+    box.style.display = 'block';
+    textEl.textContent = "Opened a new tab in Claude.ai with your story, prompts, and transcript already filled in — just hit send there to get your feedback.";
+  }
+
+  /* ---------- channel builders ---------- */
+  function vocabChips(vocab){ return vocab.map(([w,m]) => `<div class="vocab-chip md-body-small"><b>${w}</b> — ${m}</div>`).join(''); }
+  function qList(items){ return `<ul class="q-list md-body-medium">${items.map(q=>`<li>${q}</li>`).join('')}</ul>`; }
+
+  function buildListening(freqVal){
+    document.getElementById('freq-l').textContent = freqVal.toFixed(1);
+    document.getElementById('freq-l').classList.remove('off');
+    return `
+    <div class="channel listening">
+      <div class="ch-head"><div class="ch-name md-title-medium">Listening</div><div class="ch-time md-label-small">60 min</div></div>
+      <div class="audio-row">
+        <button class="audio-btn" onclick="App.playAudio(${CONFIG.SPEECH_RATE.slow},'slow')">▶ Play story (slow)</button>
+        <button class="audio-btn" onclick="App.playAudio(${CONFIG.SPEECH_RATE.normal},'normal')">▶ Play story (normal)</button>
+        <button class="audio-btn stop" id="pauseBtn" onclick="App.togglePauseStory()" disabled>❚❚ Pause</button>
+        <button class="audio-btn stop" id="stopStoryBtn" onclick="App.stopAudio()" disabled>■ Stop</button>
+      </div>
+      <div class="now-playing md-label-medium" id="nowPlaying" style="display:none;"></div>
+      <div class="audio-note md-body-small">Audio reads today's story aloud. No text — just listen.</div>
+      <ul class="ch-steps md-body-medium">
+        <li><b>Warm-up</b> 10 min — read only the title. Guess what the story might be about, out loud.</li>
+        <li><b>Listen ×2</b> 20 min — play the audio twice, eyes away from any text. Follow the story by ear alone.</li>
+        <li><b>Vocab ear-training</b> 15 min — use the box below. Hit play, guess the word by sound, then reveal it.</li>
+      </ul>
+      <div class="vocab-box">
+        <div class="vocab-word-display" id="vocabWordDisplay">? ? ? ? ?</div>
+        <div class="vocab-meaning-display md-body-small" id="vocabMeaningDisplay"></div>
+        <div class="audio-row" style="justify-content:center; margin:0;">
+          <button class="audio-btn" onclick="App.playRandomVocabWord()">🔊 Hear a random word</button>
+          <button class="audio-btn teal" onclick="App.revealVocabWord()">Reveal word &amp; meaning</button>
+        </div>
+      </div>
+      <ul class="ch-steps md-body-medium">
+        <li><b>Shadow</b> 15 min — play the full story once more, pausing after each sentence to repeat it aloud, same rhythm.</li>
+      </ul>
+    </div>`;
+  }
+
+  function buildReading(freqVal, unit){
+    document.getElementById('freq-r').textContent = freqVal.toFixed(1);
+    document.getElementById('freq-r').classList.remove('off');
+    const answerBlocks = unit.comprehension.map((q,i) => `
+      <div class="answer-block">
+        <div class="q-text md-body-medium">${i+1}. ${q}</div>
+        <textarea class="answer-input" id="ans${i}" placeholder="Type your answer here…"></textarea>
+      </div>`).join('');
+    return `
+    <div class="channel reading">
+      <div class="ch-head"><div class="ch-name md-title-medium">Reading</div><div class="ch-time md-label-small">60 min</div></div>
+      <div class="paper md-body-medium">
+        <div class="p-title md-title-medium">${unit.title}</div>
+        ${unit.passage}
+      </div>
+      <div class="vocab-list">${vocabChips(unit.vocab)}</div>
+      <ul class="ch-steps md-body-medium">
+        <li><b>Fast pass</b> 10 min — read the whole story once, quickly, for the general idea only.</li>
+        <li><b>Slow pass</b> 20 min — read again slowly. Underline the 5 vocab words wherever they appear.</li>
+        <li><b>Answer</b> 20 min — write short answers below, in full sentences.</li>
+      </ul>
+      ${answerBlocks}
+      <div class="audio-row">
+        <button class="audio-btn teal" id="checkReadingBtn" onclick="App.checkReading()">Check my understanding</button>
+      </div>
+      <div class="review-box" id="readingReviewBox">
+        <div class="review-label">Feedback &amp; what to work on</div>
+        <div class="review-text" id="readingReviewText"></div>
+      </div>
+      <ul class="ch-steps md-body-medium" style="margin-top:10px;">
+        <li><b>Wrap-up</b> 10 min — read the feedback above and rewrite your weakest answer.</li>
+      </ul>
+    </div>`;
+  }
+
+  function buildSpeaking(freqVal, unit){
+    document.getElementById('freq-s').textContent = freqVal.toFixed(1);
+    document.getElementById('freq-s').classList.remove('off');
+    return `
+    <div class="channel speaking">
+      <div class="ch-head"><div class="ch-name md-title-medium">Speaking</div><div class="ch-time md-label-small">60 min</div></div>
+      <ul class="ch-steps md-body-medium">
+        <li><b>Retell</b> 15 min — silently rehearse retelling "${unit.title}" using at least 3 vocab words from today.</li>
+      </ul>
+      <div class="audio-row">
+        <button class="audio-btn stop" id="recordBtn" onclick="App.startRecording()">● Record</button>
+        <button class="audio-btn" id="stopRecordBtn" onclick="App.stopRecording()" style="display:none;">■ Stop recording</button>
+        <span class="rec-indicator md-label-medium" id="recIndicator"><span class="rec-dot"></span> recording…</span>
+      </div>
+      <div class="audio-note md-body-small" id="transcriptNote">Speak your retelling and answers to the prompts below. Your words appear as text as you talk (Chrome/Edge). No mic access? Just type instead.</div>
+      <textarea class="transcript-box" id="speakingTranscript" placeholder="Your transcript will appear here as you speak — or type what you said manually."></textarea>
+      <audio class="playback" id="speakingPlayback" controls></audio>
+      <ul class="ch-steps md-body-medium" style="margin-top:12px;">
+        <li><b>Prompts</b> 20 min — answer these out loud while recording:</li>
+      </ul>
+      ${qList(unit.speaking)}
+      <div class="audio-row" style="margin-top:12px;">
+        <button class="audio-btn stop" id="reviewSpeakingBtn" onclick="App.reviewSpeaking()">Send for AI review</button>
+      </div>
+      <div class="review-box" id="speakingReviewBox">
+        <div class="review-label">Coach feedback</div>
+        <div class="review-text" id="speakingReviewText"></div>
+      </div>
+      <ul class="ch-steps md-body-medium" style="margin-top:10px;">
+        <li><b>Review</b> 10 min — read the feedback, then say your retelling one more time, fixing what was flagged.</li>
+      </ul>
+    </div>`;
+  }
+
+  async function generateSession(){
+    stopAudio();
+    if(state.isRecording) stopRecording();
+    state.finalTranscript = '';
+    state.vocabQueue = [];
+
+    document.getElementById('tuneBtn').disabled = true;
+    document.getElementById('rerollBtn').disabled = true;
+    document.getElementById('hint').textContent = "Tuning in… fetching today's story.";
+
+    let sourceTag = '';
+    try{
+      state.currentUnit = await fetchStoryFromAPI();
+      sourceTag = '';
+    }catch(apiErr){
+      try{
+        state.currentUnit = await generateStoryViaAI();
+        sourceTag = ' · AI-written';
+      }catch(aiErr){
+        // API and AI both unavailable — fall back to the built-in story bank, cycling through all of them before any repeat
+        state.currentUnit = await nextFallbackUnit();
+        sourceTag = ' · offline set';
+      }
+    }
+    state.recentTopics.push(state.currentUnit.topic);
+    state.recentTitles.push(state.currentUnit.title);
+
+    const fL = randFreq(), fR = randFreq(), fS = randFreq();
+
+    document.getElementById('storyTopic').textContent = state.currentUnit.topic + sourceTag;
+    document.getElementById('storyTitle').textContent = "\u201C" + state.currentUnit.title + "\u201D";
+    document.getElementById('storyMeta').classList.add('show');
+
+    let html = "";
+    html += buildListening(fL);
+    html += buildReading(fR, state.currentUnit);
+    html += buildSpeaking(fS, state.currentUnit);
+
+    document.getElementById('channels').innerHTML = html;
+    document.getElementById('channels').classList.add('show');
+    document.getElementById('footerRow').style.display = 'flex';
+    document.getElementById('hint').textContent = sourceTag
+      ? "On air — same story runs through all three channels."
+      : "On air — fresh from today's story set. Same story runs through all three channels.";
+
+    document.getElementById('tuneBtn').disabled = false;
+    document.getElementById('rerollBtn').disabled = false;
+  }
+
+  /* ============================== INIT ================================= */
+  /** Wires up the two page-level buttons. Called once on DOMContentLoaded. */
+  function init(){
+    document.getElementById('tuneBtn').addEventListener('click', generateSession);
+    document.getElementById('rerollBtn').addEventListener('click', generateSession);
+    loadVoices();
+  }
+
+  /* ============================== PUBLIC API ============================ */
+  // Exposed on window.App so the inline onclick="" handlers in the generated
+  // channel markup (see buildListening/buildReading/buildSpeaking) can reach them.
+  return {
+    init,
+    generateSession,
+    playAudio,
+    togglePauseStory,
+    stopAudio,
+    playRandomVocabWord,
+    revealVocabWord,
+    checkReading,
+    startRecording,
+    stopRecording,
+    reviewSpeaking
+  };
+
+})();
+
+// Explicitly attach to window: top-level `const` does NOT create a window
+// property (unlike `var` or function declarations), so this makes App
+// reliably reachable from inline onclick="" handlers in all environments.
+window.App = App;
+
+document.addEventListener('DOMContentLoaded', App.init);
