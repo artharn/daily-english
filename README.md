@@ -2,6 +2,44 @@
 
 A single-page English practice tool: one short story, three 60-minute channels — **Listening**, **Reading**, and **Speaking** — all built around the same story so vocabulary reinforces itself across all three skills.
 
+## Currently Feature
+| Feature | Description |
+|---|---|
+| **Random Story** | A library of over 100 stories for practicing your English skills, covering 41% of the Oxford 3000 core vocabulary. |
+| **Vocabulary Challenge** | An ear-training exercise that helps you recognize and accurately understand spoken vocabulary. |
+| **Play Story** | Listen to the story read aloud to build your listening comprehension. |
+| **Question Challenge** | Comprehension questions that reinforce and deepen your understanding of the story. |
+| **AI-Powered Feedback** | After answering the questions, your responses are reviewed by Claude, which provides corrections and personalized suggestions. |
+
+# 📚 Daily English — Learning Roadmap
+
+## Week 1: Foundation
+- [ ] Complete 1 full 3-hour session (get familiar with all 5 features)
+- [ ] Log all 5 vocab words per story (notebook/spreadsheet)
+- [ ] Try Vocab Challenge *before* reading — guess by ear first
+- **Target:** 5–7 stories · ~30 vocab words
+
+## Week 2–3: Building
+- [ ] Listen at **normal speed only** first — slow speed is backup, not default
+- [ ] Use AI Feedback every session, not occasionally
+- [ ] Answer comprehension questions in full, detailed sentences
+- [ ] Reuse 2–3 old vocab words daily before starting new story
+- **Target:** +15 stories · consistent AI review · fewer repeat grammar mistakes
+
+## Week 4: Consolidation
+- [ ] Retell the story out loud from memory *before* opening Reading card
+- [ ] Track recurring grammar corrections across sessions (spot patterns)
+- [ ] Revisit a Week 1 story — should feel noticeably easier
+- **Target:** ~30 stories total · 150+ vocab words touched
+
+## Month 2+: Second Pass
+- [ ] Once most of the ~100 stories are seen, start a second round
+- [ ] Push for faster answers, longer retells, fuller speaking
+- **Rule of thumb:** a story isn't "done" until you've used its vocab in your own sentence out loud
+
+---
+💡 **Tip:** Keep the same Claude.ai tab open across a session instead of starting fresh each time — lets AI feedback build on your patterns within the day.
+
 Live site: https://artharn.github.io/daily-english/
 
 ## Files
